@@ -22,6 +22,7 @@ const (
 	GrantTypeRefreshToken      = "refresh_token"
 	GrantTypeAuthorizationCode = "authorization_code"
 	GrantTypeClientCredentials = "client_credentials"
+	GrantTypeTokenExchange     = "urn:ietf:params:oauth:grant-type:token-exchange"
 
 	// OAuth 2.0 error codes (RFC 6749 §5.2, RFC 8628 §3.5)
 	errInvalidGrant         = "invalid_grant"
@@ -92,19 +93,22 @@ func buildTokenResponse(accessToken, refreshToken *models.AccessToken, idToken s
 // Token godoc
 //
 //	@Summary		Request access token
-//	@Description	Exchange device code or refresh token for access token (RFC 8628 and RFC 6749)
+//	@Description	Exchange a grant for an access token. Supports device_code (RFC 8628), authorization_code (RFC 6749), refresh_token (RFC 6749), client_credentials (RFC 6749 §4.4), and token exchange (RFC 8693).
 //	@Tags			OAuth
 //	@Accept			json
 //	@Accept			x-www-form-urlencoded
 //	@Produce		json
-//	@Param			grant_type		formData	string																							true	"Grant type: 'urn:ietf:params:oauth:grant-type:device_code' or 'refresh_token'"
-//	@Param			device_code		formData	string																							false	"Device code (required when grant_type=device_code)"
-//	@Param			client_id		formData	string																							true	"OAuth client ID"
-//	@Param			refresh_token	formData	string																							false	"Refresh token (required when grant_type=refresh_token)"
-//	@Success		200				{object}	object{access_token=string,refresh_token=string,token_type=string,expires_in=int,scope=string}	"Access token issued successfully"
-//	@Failure		400				{object}	object{error=string,error_description=string}													"Invalid request (unsupported_grant_type, invalid_request, authorization_pending, slow_down, expired_token, access_denied, invalid_grant)"
-//	@Failure		429				{object}	object{error=string,error_description=string}													"Rate limit exceeded"
-//	@Failure		500				{object}	object{error=string,error_description=string}													"Internal server error"
+//	@Param			grant_type			formData	string																							true	"Grant type: device_code, authorization_code, refresh_token, client_credentials, or urn:ietf:params:oauth:grant-type:token-exchange"
+//	@Param			device_code			formData	string																							false	"Device code (required when grant_type=device_code)"
+//	@Param			client_id			formData	string																							true	"OAuth client ID"
+//	@Param			refresh_token		formData	string																							false	"Refresh token (required when grant_type=refresh_token)"
+//	@Param			subject_token		formData	string																							false	"Subject token JWT (required when grant_type=token-exchange)"
+//	@Param			subject_token_type	formData	string																							false	"Subject token type (required when grant_type=token-exchange; must be urn:ietf:params:oauth:token-type:jwt)"
+//	@Success		200					{object}	object{access_token=string,refresh_token=string,token_type=string,expires_in=int,scope=string}	"Access token issued successfully"
+//	@Failure		400					{object}	object{error=string,error_description=string}													"Invalid request (unsupported_grant_type, invalid_request, authorization_pending, slow_down, expired_token, access_denied, invalid_grant)"
+//	@Failure		401					{object}	object{error=string,error_description=string}													"Client authentication failed (invalid_client)"
+//	@Failure		429					{object}	object{error=string,error_description=string}													"Rate limit exceeded"
+//	@Failure		500					{object}	object{error=string,error_description=string}													"Internal server error"
 //	@Router			/oauth/token [post]
 func (h *TokenHandler) Token(c *gin.Context) {
 	grantType := c.PostForm("grant_type")
@@ -118,12 +122,14 @@ func (h *TokenHandler) Token(c *gin.Context) {
 		h.handleAuthorizationCodeGrant(c)
 	case GrantTypeClientCredentials:
 		h.handleClientCredentialsGrant(c)
+	case GrantTypeTokenExchange:
+		h.handleTokenExchangeGrant(c)
 	default:
 		respondOAuthError(
 			c,
 			http.StatusBadRequest,
 			errUnsupportedGrant,
-			"Supported grant types: device_code, refresh_token, authorization_code, client_credentials",
+			"Supported grant types: device_code, refresh_token, authorization_code, client_credentials, urn:ietf:params:oauth:grant-type:token-exchange",
 		)
 	}
 }
@@ -588,4 +594,111 @@ func (h *TokenHandler) handleAuthorizationCodeGrant(c *gin.Context) {
 		rt = refreshToken
 	}
 	c.JSON(http.StatusOK, buildTokenResponse(accessToken, rt, idToken))
+}
+
+// handleTokenExchangeGrant handles the token exchange grant type (RFC 8693).
+// A trusted confidential client presents a subject_token (JWT signed by a
+// registered issuer) and receives an AuthGate access token bound to the
+// identity asserted in that JWT.
+func (h *TokenHandler) handleTokenExchangeGrant(c *gin.Context) {
+	// 1. Authenticate the calling client
+	clientID, clientSecret := parseClientCredentials(c)
+	if clientID == "" || clientSecret == "" {
+		c.Header("WWW-Authenticate", `Basic realm="authgate"`)
+		respondOAuthError(
+			c,
+			http.StatusUnauthorized,
+			errInvalidClient,
+			"Client authentication required: use HTTP Basic Auth or provide client_id and client_secret in the request body",
+		)
+		return
+	}
+
+	// 2. Parse required parameters
+	subjectToken := c.PostForm("subject_token")
+	subjectTokenType := c.PostForm("subject_token_type")
+	requestedScopes := c.PostForm("scope") // Optional
+
+	if subjectToken == "" || subjectTokenType == "" {
+		respondOAuthError(
+			c,
+			http.StatusBadRequest,
+			errInvalidRequest,
+			"subject_token and subject_token_type are required",
+		)
+		return
+	}
+
+	// 3. Only JWT subject tokens are supported (RFC 8693 §2.1)
+	if subjectTokenType != "urn:ietf:params:oauth:token-type:jwt" {
+		respondOAuthError(
+			c,
+			http.StatusBadRequest,
+			errInvalidRequest,
+			"unsupported subject_token_type: only urn:ietf:params:oauth:token-type:jwt is supported",
+		)
+		return
+	}
+
+	// 4. Issue token via service layer
+	accessToken, err := h.tokenService.IssueTokenExchangeToken(
+		c.Request.Context(),
+		clientID,
+		clientSecret,
+		subjectToken,
+		requestedScopes,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrInvalidClientCredentials),
+			errors.Is(err, services.ErrClientNotConfidential):
+			c.Header("WWW-Authenticate", `Basic realm="authgate"`)
+			respondOAuthError(
+				c,
+				http.StatusUnauthorized,
+				errInvalidClient,
+				"Client authentication failed",
+			)
+		case errors.Is(err, services.ErrTokenExchangeDisabled):
+			respondOAuthError(
+				c,
+				http.StatusBadRequest,
+				errUnauthorizedClient,
+				"Token exchange is not enabled for this client",
+			)
+		case errors.Is(err, services.ErrInvalidSubjectToken),
+			errors.Is(err, services.ErrInvalidIssuer):
+			respondOAuthError(
+				c,
+				http.StatusBadRequest,
+				errInvalidGrant,
+				"Subject token validation failed",
+			)
+		case errors.Is(err, token.ErrInvalidScope):
+			respondOAuthError(
+				c,
+				http.StatusBadRequest,
+				errInvalidScope,
+				"Requested scope exceeds client permissions",
+			)
+		default:
+			respondOAuthError(
+				c,
+				http.StatusInternalServerError,
+				errServerError,
+				"Token exchange failed",
+			)
+		}
+		return
+	}
+
+	// 5. RFC 8693 §2.2.1 response — no refresh token issued
+	expiresIn := max(int(time.Until(accessToken.ExpiresAt).Seconds()), 0)
+	c.JSON(http.StatusOK, gin.H{
+		"access_token":      accessToken.RawToken,
+		"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+		"token_type":        accessToken.TokenType,
+		"expires_in":        expiresIn,
+		"scope":             accessToken.Scopes,
+	})
 }
